@@ -1,0 +1,618 @@
+---
+title: "10X/BD data integration for healthy samples"
+author: "Isaac Garcia-Salinas"
+date: "30/12/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction 
+
+Here I summarize the main results from my rotation project, which main goal was to integrate single cell multimodal data (targeted mRNA + protein counts)
+generated using Becton-Dickinson (BD) Rhapsody technology, and a 10X (3') whole transcriptome sequencing data. Both datasets consist of CD4+ T cells isolated 
+from peripheral blood mononuclear cells from healthy donors, one in the BD Rhapsody dataset, and two in the 10X dataset. For integration, I used the 
+scvi-tools python library (Lopez et al., 2018), and their multimodal data analysis pipeline called totalVI (Gayoso et al., 2020). Briefly, this method aims 
+to model a cell’s state based on a joint analysis of protein and RNA data. Further, it allows to remove batch-effects and impute protein expression values 
+to cells missing this information level. For this, totalVI loads transcriptome and protein counts, as well as covariate level information, into an 
+encoder neural network that is used to build a low dimensional representation of a cell's state (Gayoso et al., 2020).
+
+CD4+ T cell data generated with the BD technology was available as part of the Trzupek et al., 2019 publication, which included targeted transcriptome 
+sequencing of 399 genes, and profiling for up to 56 cell surface proteins. This dataset was accessed with the GEO accession series ID GSE150060, from where I obtained
+counts matrices and cell-level metadata. Whole 10X data was produced by the Trynka team as part of the immunodeficiencies project. 
+
+In the next chunks, I describe the main methods I followed to integrate both datasets. All code shown in this markdown should be run while maintaining the 
+directory structure set in the "igs_rotation" drive folder.
+
+```{r all_setup, echo=FALSE}
+
+set.seed(123456)
+
+lapply(c("dplyr", "Seurat", "ggplot2", "tidyverse", "ggsci", "rlang", 
+         "ggpubr"), library, character.only=T)
+
+main_dir <- getwd()  
+data_dir <- paste0(main_dir, "/data/")
+BD_data_dir <- paste0(data_dir, "paper_original_datasets/")
+write_dir <- paste0(main_dir, "/write/")
+scripts_dir <- paste0(main_dir, "/scripts/")
+#plots_dir <- paste0(main_dir, "/plots/")
+
+lapply(c("loadSingleDataset_Ferreira2020_data_spec.R",
+         "ggplot_final_Processing.R", 
+         "expressionHeatmaps.R",  
+         "scPlot_themes.R"), function(aScript){
+           loadThis <- paste0(scripts_dir, aScript)
+           source(file = loadThis, local = F)
+         })
+
+
+```
+
+## Reading data
+
+In the next chunk I use a function that reads csv BD data, while subseting to non-multiplet cells, as identified in each csv metadata. As the 
+Trzupek, et al., 2019 data contains three donors in total (one healthy, two non-healthy), it is possible to read their information with the 
+same function. Note: Only resting cell information can be retrieved.
+
+
+```{r reading_BD_data, eval=FALSE}
+
+# Next function can also return a matrix instead of a seurat by setting 
+# returnSeurat to FALSE. In addtion, dataType can be "all", "rna", or "protein"
+# to retrieve data type subsets of a given donor. In all cases multiplet cells are 
+# removed
+
+healthy_seu_raw <- loadSingleDataset(dataDir = BD_data_dir, loadWhat = "healthy", 
+                                     dataType = "all", returnSeurat = TRUE)
+t1d_seu_raw <- loadSingleDataset(dataDir = BD_data_dir, loadWhat = "t1d", 
+                                 dataType = "all", returnSeurat = TRUE)
+sle_seu_raw <- loadSingleDataset(dataDir = BD_data_dir, loadWhat = "sle", 
+                                 dataType = "all", returnSeurat = TRUE)
+
+
+```
+
+
+# Features in the BD datasets
+
+As described in the original paper, some of the previous datasets profiled a slightly different number features, out of a 
+total of 399 genes and 56 proteins for the datasets altogether (455 total features). For instance, the  SLE dataset contains 436 features, 
+and 13 features are unique to this dataset. In the case of the Healthy and T1D dataset, the same number of features were profiled, and total to 
+442 features. From these, 19 are not present in the SLE dataset. 
+
+
+```{r shared features between the Trzupek 2019 datasets, echo=FALSE} 
+
+print(  paste0("SLE data total features: ", length(rownames(sle_seu_raw)) ) ) 
+
+print(  paste0("T1D data total features: ", length(rownames(t1d_seu_raw)) ) ) 
+
+print(  paste0("Healthy data total features: ", length(rownames(healthy_seu_raw)) ) ) 
+
+print( paste0("Intersecting features between T1D and Healthy datasets: ", 
+              length(intersect(rownames(healthy_seu_raw), rownames(t1d_seu_raw)) ) )   )
+
+print( paste0("Intersecting features between T1D/Healthy and SLE datasets: ", 
+              length( intersect(rownames(sle_seu_raw), rownames(t1d_seu_raw)) ) )   )
+
+print( paste0("Features unique to the SLE dataset: ", 
+              length( setdiff(rownames(sle_seu_raw), rownames(t1d_seu_raw)) ) )   )
+
+print( paste0("Features unique to the T1D/Healthy dataset: ", 
+              length( setdiff(rownames(t1d_seu_raw), rownames(sle_seu_raw)) ) )   )
+
+print( paste0("Total features (all datasets union) ", 
+              length( unique(c(rownames(t1d_seu_raw), rownames(sle_seu_raw), rownames(healthy_seu_raw)) ) ) ))
+
+# allDatasetsFeatVenn <- venn.diagram(x=list(rownames(t1d_seu_raw), rownames(healthy_seu_raw), 
+# rownames(sle_seu_raw) ), category.names = c("T1D" , "Healthy", "SLE"),filename = NULL)
+# grid.draw(allDatasetsFeatVenn)
+
+```
+
+
+Prior integrating 10X and BD data, I tested the integration of all BD datasets as means to reproduce some of 
+the main findings in the Trzupek paper, and to standardize the analysis of multimodal data. As part of this, I 
+merged such datasets, and because of this operation, counts for features not profiled in a given sample were 
+set to 0 in the cells in that sample. For this reason, further analyses using counts for the healthy sample only, 
+show total feature counts that reflect the union of all features in all the datasets reported by Trzupek et al., 
+(i.e. 455 features, 399 genes and 56 proteins). 
+
+As part of this repository data, I have included the healthy counts matrix reflecting the processing described 
+above. Features in this matrix are further arranged to first show transcript features, and then protein features, 
+which will be helpful when converting this data to the h5 format, which is required for totalVI-based analyses. 
+This counts matrix can be found under the name "bd_healthy_counts_matrix.csv".
+
+The feature arrangement in the counts matrix described above follows the row order shown in the 
+"BD features table", where I summarize all the features profiled in the Trzupek publication. This resource is also 
+available in the data directory under the name "allBD_features_table.txt".
+
+
+## Recovering healthy samples counts matrix from 10X datatsets 
+
+In the next chunk, I show the processing of the 10X data to be integrated with the BD healthy dataset.
+For this, I merge each of the 10X healthy datasets using Seurat, and recover the counts matrix of the final object.
+To be able to impute proteins using totalVI, I generated a 0-filled matrix for protein features that is appended to 
+the 10X matrix.
+
+
+```{r recovering the 10X counts matrix, eval=FALSE}
+
+# 3 seurat objects contained transcript counts for 2 healthy donors 
+# in the immunodeficiencies project
+
+# Next is a table containing all features analyzed in the BD datasets
+allBD_features_ordered <-  read.csv(file = paste0(data_dir, "allBD_features_table.tsv"), 
+                                   sep="\t", header = T)
+# Select protein features to build a zero-filled matrix
+allBDProtFeatures <- subset(allBD_features_ordered, suffix_dtype == "pAbO")[["gene.prot_name"]]
+
+
+p1 <- readRDS(paste0(data_dir, "PID_10X7838125_Ctrl_1.CD4.rds"))
+DefaultAssay(p1) <- "RNA"
+p2 <- readRDS(paste0(data_dir, "PID_10X8012526_CTRL_3.CD4.rds"))
+DefaultAssay(p2) <- "RNA"
+p3 <- readRDS(paste0(data_dir, "PID_10X8012527_CTRL_3.CD4.rds"))
+DefaultAssay(p3) <- "RNA"
+
+pats_temp <- merge(x= p1, y = p2)
+allControls <- merge(pats_temp, p3)
+
+# Adding protein features to 10X data as zeroes
+sim_missingProteinCounts_10X <- matrix(rep(0,285208), 
+                                       nrow=length(allBDProtFeatures), 
+                                       ncol =  length(colnames(allControls)), 
+                                       dimnames = list(allBDProtFeatures, 
+                                                       colnames(allControls))) 
+# recover 10X matrix for merged datasets
+allcontrolsMatrix <- as.matrix(GetAssayData( object =allControls, slot="counts", assay="RNA"))
+
+# append zeroes-matrix and export as csv
+write.table(x = rbind(as.matrix(allcontrolsMatrix, sim_missingProteinCounts_10X), 
+            file = paste0(write_dir, "three_healthy10X_counts_matrix_wMissingProt.csv"), 
+            sep = ",", quote = F, row.names = T, col.names = T)
+
+```
+
+
+## Converting csv counts matrices to h5 matrices
+
+The totalVI pipeline is part of the scvi-tools python library, which require to read mutimodal data formatted as an h5
+matrix. Although several tools exist to convert directly between Seurat (or csv) format to h5, none of this allows to 
+keep metadata to identify the protein features, which is required for further processing using scvi-tools. For this reason, 
+I wrote a python script that allowed me to convert a csv counts matrix to an h5 file that was able to solver this problem
+This mimics the format of an h5 matrix containing multimodal data as if it was natively
+produced with the 10X processing software. In the next chunk I provide an example of how to execute this script. I include
+the h5 matrices obtained with this method as part of this repository data folder.
+
+
+```{bash Converting csv to h5, eval=FALSE, engine="sh"}
+
+# headerless_bd_geneNames.txt correspond to a txt with a feature name per row
+# The order of this file has to follow the order of the matrix features
+
+currentDir=$(pwd)
+data_folder=${currentDir}"/data"
+bd_feature_names="headerless_bd_geneNames.txt"
+bd_gene_count=399
+bd_protein_count=56
+bd_healthy_csv="bd_healthy_counts_matrix.csv"
+
+
+# Convert csv files to h5 matrices
+./csv2h5_igs.py -g ${bd_gene_count} -p ${bd_protein_count} -m ${bd_healthy_csv} -d ${bd_feature_names} -s ${data_folder} -o bd_healthy_counts
+
+```
+
+
+## Integrating BD and 10X data using scvi-tools and totalVI
+
+h5 matrices obtained with the above method are used for integration in scvi-tools. 
+As explained in this' package documentation (https://www.scvi-tools.org/en/stable/installation.html), 
+a specific conda environment is required for execution. In the next chunk, I include the code used to integrate 
+the healthy samples BD and 10X datasets.
+
+
+```{python BD/10X integration using scvi-tools and totalVI, eval=FALSE}
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os 
+import scvi
+
+import scanpy as sc
+
+currDir = os.getcwd()
+data_dir = currDir+"/data/"
+write_dir = currDir+"/write/"
+
+# Read data using scanpy
+healthy_10x = sc.read_10x_h5(filename=data_dir+"three_healthy10X_counts_matrix_wMissingProt.h5",
+gex_only = False)
+healthy_bd = sc.read_10x_h5(filename=data_dir+"bd_healthy_counts_matrix.h5", 
+gex_only = False)
+
+# Metadata containing total number of features per cell and sample origin
+all_metadata = pd.read_csv(data_dir+"all_10xBD_metadata.csv", delimiter=",", header=0)
+# Supplied metadata contains all samples (t1d/sle/heathy for BD data, and the 2 controls from 10X)
+# In here, I select only metadata corresponding to the healthy samples - "Ctrl_1","CTRL_3" correspond
+# to 10X data 
+all_metadata=all_metadata.loc[all_metadata['sample'].isin(["Ctrl_1","CTRL_3", "Healthy"])]
+
+
+# Concatenate anndata objects using scanpy
+alldata_sc = healthy_10x.concatenate(healthy_bd,index_unique=None)
+
+# add metadata 
+alldata_sc.obs["nFeature_RNA"] = all_metadata["nFeature_RNA"]
+alldata_sc.obs["sample"] = all_metadata["sample"]
+alldata_sc.obs["technology"] = all_metadata["technology"]
+
+# next scvi-tools command differentiates between protein and transcript data
+# this information is available as part of the h5 matrices
+# this command puts protein expression in alldata_sc.obms["protein_expression]
+scvi.data.organize_cite_seq_10x(alldata_sc) 
+
+
+# Scvi-tools models use raw count data, but normalization can be performed for other 
+# applications, just ensure that raw counts are kept unchanged
+alldata_sc.layers["counts"] = alldata_sc.X.copy()
+sc.pp.normalize_total(alldata_sc, target_sum=1e4)
+sc.pp.log1p(alldata_sc)
+alldata_sc.raw = alldata_sc
+
+# totalVI model runs over variable features, that can be calculated using standard 
+# seurat methods, in this case, the variance stabilization method (vst). 
+sc.pp.highly_variable_genes(
+    alldata_sc,
+    n_top_genes=2000,
+    flavor="seurat_v3",
+    subset=True,
+    layer="counts"
+)
+
+# The next scvi-tools command allows to determine the main variable to be considered 
+# for batch effect correction as well as extra covariates that may add technical 
+# noise to downstream analyses. In this case, I consider technology (10X/BD) as 
+# as the main batch source, and sample (donor) and library size as a extra covariates.
+scvi.data.setup_anndata(
+    alldata_sc, batch_key="technology",continuous_covariate_keys=['nFeature_RNA'],
+    layer="counts", categorical_covariate_keys=['sample'],
+    protein_expression_obsm_key="protein_expression"
+)
+
+# Running the totalVI's variational autoencoder (VAE) model
+vae_model = scvi.model.TOTALVI(alldata_sc, use_cuda=True, latent_distribution="normal")
+vae_model.train()
+
+# The VAE model latent representation has a similar format to a PCA table and can 
+# be saved as a matrix that can be used to calculate UMAP in Seurat
+# The next file is provided in the data directory
+np.savetxt(write_dir+"HealthySamples_BD_all10X_totalVI_latent_representation_byTechBySample.csv", 
+vae_model.get_latent_representation(), 
+              delimiter=",", fmt='%f')
+
+# Denoised protein and RNA values are calculated while accounting for the 'state' of 
+# a cell as represented by the VAE model
+# Transformed batch allows to impute protein values as if these were taken from 
+# the batch containing observed protein values, in this case, the BD healthy sample
+# transformed_batch paramter corresponds to scvi_tools batch metadata (0-indexed)
+# as shown in the anndata.obs table 
+rna_norm, protein_scaled = vae_model.get_normalized_expression(transform_batch=[1], 
+n_samples=25, return_mean=True)
+
+# Denoised feature values are exported for further analysis in Seurat
+# The next files are provided in the data directory
+protein_scaled.to_csv(write_dir+"HealthySamples_BD_all10X_totalVI_denoised_protein_data_BD_scaled_byTechBySample.tsv", 
+sep="\t", float_format="%f")
+rna_norm.to_csv(write_dir+"HealthySamples_BD_all10X_totalVI_denoised_rna_data_BD_scaled_byTechBySample.tsv", 
+sep="\t", float_format="%f")
+
+```
+
+## Adding totalVI latent space to Seurat
+
+The latent space obtained from totalVI can be used for 
+downstream analysis (UMAP/clustering calculation) in Seurat, This is illustrated below.
+
+```{r UMAP/Clustering calculation using totalVI latent space in Seurat, eval=FALSE}
+
+all10X_BD_metadata <- read.table(paste0(data_dir, "all_10xBD_metadata.csv"), 
+                                 sep = ",", row.names = 1, header=T)
+all10X_BD_metadata <- subset(all10X_BD_metadata, sample %in% 
+                                 c("Ctrl_1","CTRL_3", "Healthy"))
+allCellNames <- rownames(all10X_BD_metadata)
+
+
+denoisedProtein <- t(as.matrix(
+    read.csv(file = paste0(data_dir, "HealthySamples_BD_all10X_totalVI_denoised_protein_data_BD_scaled_byTechBySample.tsv"),
+             sep = "\t", header=T, row.names = 1)))
+
+denoisedRNA <- t(as.matrix(
+    read.csv(file= paste0(data_dir, "HealthySamples_BD_all10X_totalVI_denoised_rna_data_BD_scaled_byTechBySample.tsv"),
+             sep = "\t", header=T, row.names = 1)))
+
+intData_latent <- as.matrix(
+    read.csv(file = paste0(data_dir, "HealthySamples_BD_all10X_totalVI_latent_representation_byTechBySample.csv"), 
+             sep = ",", header = F, row.names = allCellNames, 
+             colClasses = "numeric"))
+
+colnames(denoisedProtein) <- allCellNames
+colnames(denoisedRNA) <- allCellNames
+
+full_denoised_values_matrix <- rbind(denoisedRNA, denoisedProtein)
+
+allHealthies_int_totalVI <- CreateSeuratObject(counts = full_denoised_values_matrix, 
+                                               assay = "scvi_denoised")
+
+allHealthies_int_totalVI[['scvi']] <- CreateDimReducObject(embeddings = intData_latent, 
+                                                           key = "scvi_", 
+                                                           assay = "scvi_denoised")
+
+# UMAP and clustering is performed using the latent space obtained from totalVI
+# This reduction replaces PCA, which is the common the standard for this routines.
+allHealthies_int_totalVI <- FindNeighbors(allHealthies_int_totalVI,
+                                          reduction = 'scvi', dims=1:20)
+allHealthies_int_totalVI <- FindClusters(allHealthies_int_totalVI, 
+                                         resolution = 0.6, 
+                                         graph.name = "scvi_denoised_snn")
+allHealthies_int_totalVI <- RunUMAP(allHealthies_int_totalVI, 
+                                    reduction = 'scvi', dims=1:20)
+
+
+tech_metadata_allHealthies <- all10X_BD_metadata$technology
+names(tech_metadata_allHealthies) <- rownames(all10X_BD_metadata)
+allHealthies_int_totalVI <- AddMetaData(allHealthies_int_totalVI, 
+                                               metadata = tech_metadata_allHealthies, 
+                                               col.name = "technology")
+
+donor_metadata_allHealthies <- all10X_BD_metadata$sample
+names(donor_metadata_allHealthies) <- rownames(all10X_BD_metadata)
+allHealthies_int_totalVI <- AddMetaData(allHealthies_int_totalVI, 
+                                               metadata = donor_metadata_allHealthies, 
+                                               col.name = "donor")
+
+```
+
+
+## Differential expression analysis
+
+The scvi-tools/totalVI authors do not recommend performing standard differential expression (DE) testing over denoised 
+protein/RNA values, as it fails to account for the uncertainity of the denoising correction. In here, I apply DE testing 
+over raw feature counts and over the cells where those features where detected (e.g. 10X features over 10X cells) while 
+using the unsupervised clustering obtained form the totalVI integrated dataset (BD+10X). Further, I use the Seurat 
+'FindConsevedMarkers' function to detect significantly DE genes that are shared between technologies. In the next chunk, 
+I apply these operations using a Seurat object containing two assays. The first, "allData", contains the merged raw counts 
+matrices for the BD/10X healthy datasets, which are used to calculate DE using the negative binomial test. 
+The second, "scvi_denoised", contains the denoised RNA/protein values obtained from the totalVI integration approach. 
+Although, as mentioned, these values should not be used in standard DE testing, these can be used 
+to display feature expression over UMAP/tSNE projections. Additionally, DE testing with denoised feature counts 
+still can render valid results when using the Bayesian pipeline provided by scvi-tools.
+
+Tables of differential expression obtained with the next code are also provided in the data folder. 
+To facilitate interpretation of these values, I plot all the per cluster positively DE genes as heatmaps, which are 
+available in the plots folder of this repository.
+
+
+```{r DE testing over BD/10X integrated dataset}
+
+allHealthies_int_totalVI <- readRDS(paste0(data_dir, "allHealthies_int_totalVI_techBatch_pNFeature_SampleCov_final.rds"))
+
+allhealthy_10Xcells <- rownames(subset(allHealthies_int_totalVI@meta.data, technology == "10X"))
+allhealthy_BDcells <- rownames(subset(allHealthies_int_totalVI@meta.data, technology == "BD"))
+
+# remove mitochondrial genes and ribosomal subunits 
+intFeatures <-  grep(x=rownames(allHealthies_int_totalVI), 
+                        pattern = paste(c("^MT-", "^MTRNR", "RPL", "RPS"), 
+                                        collapse = "|"), invert = T)
+
+# perform DE testing on raw counts
+DefaultAssay(allHealthies_int_totalVI) <- "allData"
+# Use clustering obtained with totalVI latent space 
+Idents(allHealthies_int_totalVI) <- "scvi_denoised_snn_res.0.6"
+levels(allHealthies_int_totalVI) <- c(0:8)
+
+# Markers for 10X cells only
+markers_10XOnly <- FindAllMarkers(object = subset(allHealthies_int_totalVI, cells=allhealthy_10Xcells), 
+                                  assay = "allData", features = intFeatures, test.use = "negbinom")
+
+# match() - this sets an arrangement for clusters by their putative identity 
+# (e.g.: c(0,1,4) == "naive cells"). This arrangement was set 'a posteriori' 
+# to DE analysis, but is included in here as it makes expression 
+# heatmaps clearer.
+
+top10XMarkers <- markers_10XOnly %>% subset(p_val_adj <= 0.05) %>%
+    arrange(match(cluster, c(0,1,4, 6,7, 2,3,5, 8))) %>% 
+    group_by(cluster) %>% top_n(n = 10, wt = avg_logFC)
+
+# heatmaps display values in scaled.data slot. For this, raw counts were normalized using 
+# standard seurat log normalization. Normalized counts were centred and scaled using 
+# Seurat's ScaleData() function while regressing the variables: "nFeature_allData", 
+# "percent.mt","S.Score", "G2M.Score", "nCount_allData", and "donor".
+
+top10XFeatures_heatmap <- seurat_expression_heatmap(aSeuratObject = allHealthies_int_totalVI, 
+                          specificGenes = unique(subset(top10XMarkers, avg_logFC > 0 )[["gene"]]), 
+                          specificIDs = c(0,1,4, 6,7, 2,3,5, 8), 
+                          lookAtID = "scvi_denoised_snn_res.0.6",
+                          ColPalette = "ggplot",
+                          useAssay = "allData", 
+                          cells = allhealthy_10Xcells)
+
+top10XFeatures_heatmap <- top10XFeatures_heatmap + 
+    labs(title= "Top 10 DE features - unsupervised clustering over totalVI BD/10X integration", 
+         subtitle="10X healthy sample cells") + 
+  theme(plot.title = element_text(face="bold", size=14), axis.text.y = element_text(size = 12))
+
+
+# Markers for BD cells only
+markers_BDOnly <- FindAllMarkers(object = subset(allHealthies_int_totalVI, cells=allhealthy_BDcells), 
+                                  assay = "allData", features = intFeatures, test.use = "negbinom")
+
+topBDMarkers <- markers_BDOnly %>% subset(p_val_adj <= 0.05) %>%
+    arrange(match(cluster, c(0,1,4, 6,7, 2,3,5, 8))) %>% 
+    group_by(cluster) %>% top_n(n = 10, wt = avg_logFC)
+
+
+# Next function allows to match colors in the upper heatmap bar with those shown in a 
+# UMAP generated using a specific level order. This also subsets the supplied object to 
+# idents of interest, in a way that those not requested will not appear empty in 
+# the final heatmap, which is the beahvior of the DoHeatmap() original function.
+BDtopFeatures_heatmap <- seurat_expression_heatmap(aSeuratObject =  allHealthies_int_totalVI, 
+                          specificGenes = unique(subset(topBDMarkers, avg_logFC > 0 )[["gene"]]), 
+                          specificIDs = c(0,1,4, 6,7, 2,3,5, 8), 
+                          lookAtID = "scvi_denoised_snn_res.0.6",
+                          ColPalette = "ggplot",
+                          useAssay = "allData", 
+                          cells = allhealthy_BDcells)
+
+BDtopFeatures_heatmap <- BDtopFeatures_heatmap + 
+    labs(title= "Top 10 DE features - unsupervised clustering over totalVI BD/10X integration", 
+         subtitle="BD healthy sample cells") + 
+  theme(plot.title = element_text(face="bold", size=14), axis.text.y = element_text(size = 12))
+
+# These parameters are taken by saveThosePlots() to set the final figure size (inches)
+global_height <- 9 
+global_width <- 13
+
+saveThosePlots(BDtopFeatures_heatmap, 
+               aFileName = "BDtopFeatures_heatmap_final.png",
+               outDir = write_dir)
+
+saveThosePlots(top10XFeatures_heatmap, 
+               aFileName = "top10XFeatures_heatmap_final.png",
+               outDir = write_dir)
+
+
+# Based on protein expression, I merge the naive clusters (0,1,4) in a single cluster
+# Remaining clusters are mostly the same, with the exception of EMRA cells, that represent
+# a subset from the cluster 5, which cells express CD45RA. Cluster 8 was removed as 
+# this cluster is mainly composed of 10X cells only.
+# These identities are stored as 'markerCellIDs'.
+# I use this clustering to calculate conserved markers.
+
+Idents(allHealthies_int_totalVI) <- "markerCellIDs"
+
+healthies_aggregatedIDs <- c("Naive","Treg naive", "Treg memory", "Effector LGALS1 high", 
+                             "Effector KLRB1 high", "Efector cytotoxic", "EMRA")
+
+
+allHealthies_conserved_markers_2 <- do.call(rbind, lapply(healthies_aggregatedIDs, 
+                                                        function(aCellType, 
+                                                                 broadIDs=healthies_aggregatedIDs, 
+                                                                 aSeuratObject=allHealthies_int_totalVI){
+  
+  cellTypeBase <- broadIDs[-c(grep(x=broadIDs, pattern = aCellType))]
+  
+  activated_consMarkers_IDs <- FindConservedMarkers(aSeuratObject, 
+                                                    grouping.var = "technology", 
+                                                    ident.1 = aCellType, 
+                                                    ident.2 = cellTypeBase, 
+                                                    slot = "counts", assay="allData", 
+                                                    test.use = "negbinom") %>% 
+    rownames_to_column("gene") %>% mutate(marker4cellID=aCellType)
+  
+})
+)
+
+# Correlation between avg_expression of BD and 10X cells is similar:
+#cor(allHealthies_conserved_markers_2[["BD_avg_logFC"]], allHealthies_conserved_markers_2[["10X_avg_logFC"]])
+# [1] 0.9498376
+# BD_avg_logFC is thus used to subset to genes with positive expression changes and 
+# expression sorting
+
+# Arrange conserved markers based on avg_logFC 
+
+arrangedConservedMarkers <- allHealthies_conserved_markers_2 %>% 
+    arrange(match(marker4cellID, healthies_aggregatedIDs)) %>% 
+    group_by(marker4cellID) %>% top_n(n = 20, wt = BD_avg_logFC)
+
+ConservedFeatures_heatmap <- seurat_expression_heatmap(aSeuratObject =  allHealthies_int_totalVI, 
+                          specificGenes = unique(subset(arrangedConservedMarkers, BD_avg_logFC > 0 )[["gene"]]), 
+                          specificIDs = healthies_aggregatedIDs, 
+                          lookAtID = "markerCellIDs",
+                          ColPalette = "ggsci",
+                          useAssay = "allData", label=F)
+
+ConservedFeatures_heatmap <- ConservedFeatures_heatmap + 
+    labs(title= "Conserved DE features - marker based cell IDs", 
+         subtitle="All cells in the integrated dataset") + 
+  theme(plot.title = element_text(face="bold", size=14), axis.text.y = element_text(size = 12))
+
+global_height <- 9 
+global_width <- 13
+
+saveThosePlots(ConservedFeatures_heatmap, 
+               aFileName = "conservedFeatures_heatmap_final.png",
+               outDir = write_dir)
+
+```
+
+# UMAP plots
+
+I the next chunk I provide the code used to generate the remaining figures in the plots folder.
+
+```{r UMAPs for integrated dataset identities}
+
+# remove cells in cluster 8 as these are 10X cells only
+cell2Plot <- rownames(subset(allHealthies_int_totalVI@meta.data, !(markerCellIDs == "unknown" )))
+
+Idents(allHealthies_int_totalVI) <- "scvi_denoised_snn_res.0.6"
+
+integration_clustering <- plotA_UMAP(aSeuratObject = allHealthies_int_totalVI, 
+           aTitle = "totalVI 10X/BD integration", 
+           aSubTitle = "0.6 clustering granularity", pt.size=0.7, label=T, 
+           label.box=T, repel=T, cells=cell2Plot) + donwstreamSC_UMAP_theme()
+
+Idents(allHealthies_int_totalVI) <- "technology"
+
+integration_tech <- plotA_UMAP(aSeuratObject = allHealthies_int_totalVI, 
+           aTitle = "totalVI 10X/BD integration", 
+           aSubTitle = "technology", pt.size=0.7, label=T, 
+           label.box=T, repel=T, cells=cell2Plot) + donwstreamSC_UMAP_theme()
+
+Idents(allHealthies_int_totalVI) <- "markerCellIDs"
+
+integration_finalcellIds <- plotA_UMAP(aSeuratObject = allHealthies_int_totalVI, 
+           aTitle = "totalVI 10X/BD integration", 
+           aSubTitle = "final cell IDs - marker based", pt.size=0.7, label=T, 
+           label.box=T, repel=T, cells=cell2Plot, cols=pal_igv()(8)) + donwstreamSC_UMAP_theme()
+
+global_height <- 7
+global_width <- 7
+
+saveThosePlots(integration_clustering, 
+               aFileName = "integration_clustering_final.png",
+               outDir = write_dir)
+saveThosePlots(integration_tech, 
+               aFileName = "integration_tech_final.png",
+               outDir = write_dir)
+saveThosePlots(integration_finalcellIds, 
+               aFileName = "integration_finalcellIds_final.png",
+               outDir = write_dir)
+
+# Plot denoised protein values - e.g CD45RA/R0 
+DefaultAssay(allHealthies_int_totalVI) <- "scvi_denoised" # - NOTE!! Feature names in 
+# this assay contain points (.) instead of dahses (-)
+# Feature values in this slot have not been tranformed
+
+raro_expression_allCells <- annotate_figure(p = ggarrange(
+FeaturePlot(allHealthies_int_totalVI, features = c("CD45RA.AHS0029"), 
+            pt.size = 0.7, cells = cell2Plot) + featureUMAP_theme(showLegend = "right"),
+FeaturePlot(allHealthies_int_totalVI, features = c("CD45RO.AHS0036"), 
+            pt.size = 0.7, order=T, cells = cell2Plot) + featureUMAP_theme(showLegend = "right"), 
+ncol = 2, nrow=1
+), top = text_grob(label = "Imputed protein expression - Integrated 10X/BD datasets", 
+                   face="bold", size=13))
+
+global_height <- 4
+global_width <- 8
+saveThosePlots(raro_expression_allCells, aFileName = "raroExpression_imputed_final.png", outDir = main_dir)
+
+
+```
+
+
